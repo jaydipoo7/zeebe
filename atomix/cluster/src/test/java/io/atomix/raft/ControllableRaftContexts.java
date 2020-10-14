@@ -133,7 +133,11 @@ public class ControllableRaftContexts {
     getDeterministicScheduler(MemberId.from(String.valueOf(0)))
         .tick(2 * electionTimeout, TimeUnit.MILLISECONDS);
     final var joinFuture = CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new));
+
+    // Should trigger executions and message delivery
     while (!joinFuture.isDone()) {
+      deliverAllMessage();
+      processAllMessage();
       runUntilDone();
     }
     joinFuture.get(1, TimeUnit.SECONDS);
@@ -212,10 +216,9 @@ public class ControllableRaftContexts {
 
   // Methods to control the execution of raft threads
 
-  // run until there are no more message and task to process
+  // run until there are no more task to process
   public void runUntilDone() {
     final var serverIds = raftServers.keySet();
-    processAllMessage();
     serverIds.forEach(memberId -> getDeterministicScheduler(memberId).runUntilIdle());
   }
 
@@ -236,6 +239,16 @@ public class ControllableRaftContexts {
     if (!scheduler.isIdle()) {
       scheduler.runNextPendingCommand();
     }
+  }
+
+  public void deliverAllMessage() {
+    for (final MemberId memberId : getRaftServers().keySet()) {
+      getRaftServers().keySet().forEach(target -> deliverAllMessage(memberId, target));
+    }
+  }
+
+  public void deliverAllMessage(final MemberId source, final MemberId target) {
+    getServerProtocol(source).deliverAll(target);
   }
 
   // Submit all messages from the incoming queue to the schedulers to process
@@ -274,7 +287,7 @@ public class ControllableRaftContexts {
   }
 
   // Execute an append on memberid. If memberid is not the the leader, the append will be rejected.
-  public void clientAppend(final MemberId memberId) {
+  private void clientAppend(final MemberId memberId) {
     final var role = getRaftContext(memberId).getRaftRole();
     if (role instanceof LeaderRole) {
       final ByteBuffer data = ByteBuffer.allocate(Integer.BYTES).putInt(0, nextEntry++);

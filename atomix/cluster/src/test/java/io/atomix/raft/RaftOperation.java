@@ -68,8 +68,6 @@ public class RaftOperation {
     defaultRaftOperation.add(
         RaftOperation.of("tick 50ms", (raftRule, m) -> raftRule.tick(m, Duration.ofMillis(50))));
     defaultRaftOperation.add(
-        RaftOperation.of("clientAppend", (raftRule, memberId) -> raftRule.clientAppend(memberId)));
-    defaultRaftOperation.add(
         RaftOperation.of("clientAppendOnLeader", (raftRule, m) -> raftRule.clientAppendOnLeader()));
 
     serverIds.forEach(
