@@ -23,7 +23,6 @@ import io.atomix.cluster.MemberId;
 import io.atomix.raft.impl.RaftContext;
 import io.atomix.raft.partition.impl.RaftNamespaces;
 import io.atomix.raft.protocol.ControllableRaftServerProtocol;
-import io.atomix.raft.protocol.RaftMessage;
 import io.atomix.raft.roles.LeaderRole;
 import io.atomix.raft.snapshot.TestSnapshotStore;
 import io.atomix.raft.storage.RaftStorage;
@@ -55,11 +54,16 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.jmock.lib.concurrent.DeterministicScheduler;
 
-public class RaftContextRule {
+/**
+ * Uses a DeterministicScheduler and controllable messaging layer to get a deterministic execution
+ * of raft threads. Note:- Currently there is some non-determinism hidden in the raft. Hence it is
+ * not fully deterministic.
+ */
+public class ControllableRaftContexts {
 
   private final Map<MemberId, ControllableRaftServerProtocol> serverProtocols = new HashMap<>();
-  private final Map<MemberId, Queue<Tuple<RaftMessage, Tuple<Runnable, CompletableFuture>>>>
-      messageQueue = new HashMap<>();
+  private final Map<MemberId, Queue<Tuple<Runnable, CompletableFuture>>> messageQueue =
+      new HashMap<>();
   private final Map<MemberId, DeterministicSingleThreadContext> deterministicExecutors =
       new HashMap<>();
 
@@ -70,10 +74,11 @@ public class RaftContextRule {
   private Duration electionTimeout;
   private Duration hearbeatTimeout;
   private int nextEntry = 0;
-  // Used only for verification
+
+  // Used only for verification. Map[term -> leader]
   private final Map<Long, MemberId> leadersAtTerms = new HashMap<>();
 
-  public RaftContextRule(final int nodeCount) {
+  public ControllableRaftContexts(final int nodeCount) {
     this.nodeCount = nodeCount;
   }
 
@@ -81,29 +86,28 @@ public class RaftContextRule {
     return raftServers;
   }
 
-  public RaftContext getRaftServer(final int memberId) {
+  public RaftContext getRaftContext(final int memberId) {
     return raftServers.get(MemberId.from(String.valueOf(memberId)));
   }
 
-  public RaftContext getRaftServer(final MemberId memberId) {
+  public RaftContext getRaftContext(final MemberId memberId) {
     return raftServers.get(memberId);
   }
 
-  public void before(final Path directory, final Random random) throws Exception {
+  public void setup(final Path directory, final Random random) throws Exception {
     this.directory = directory;
     if (nodeCount > 0) {
-      createRaftContexts(nodeCount);
-      raftServers.values().forEach(raft -> raft.setRandom(random));
+      createRaftContexts(nodeCount, random);
     }
     joinRaftServers();
-    electionTimeout = getRaftServer(0).getElectionTimeout();
-    hearbeatTimeout = getRaftServer(0).getHeartbeatInterval();
+    electionTimeout = getRaftContext(0).getElectionTimeout();
+    hearbeatTimeout = getRaftContext(0).getHeartbeatInterval();
 
     // expecting 0 to be the leader
     tickHeartbeatTimeout(0);
   }
 
-  public void after() throws IOException {
+  public void shudown() throws IOException {
     raftServers.forEach((m, c) -> c.close());
     raftServers.clear();
     serverProtocols.clear();
@@ -122,12 +126,10 @@ public class RaftContextRule {
         servers.get(MemberId.from(String.valueOf(0))).getElectionTimeout().toMillis();
     Collections.sort(serverIds);
     servers.forEach(
-        (memberId, raftContext) -> {
-          futures.add(raftContext.getCluster().bootstrap(serverIds));
-        });
+        (memberId, raftContext) -> futures.add(raftContext.getCluster().bootstrap(serverIds)));
 
     runUntilDone(0);
-    // trigger election on 0
+    // trigger election on 0 so that 0 is initially the leader
     getDeterministicScheduler(MemberId.from(String.valueOf(0)))
         .tick(2 * electionTimeout, TimeUnit.MILLISECONDS);
     final var joinFuture = CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new));
@@ -137,14 +139,14 @@ public class RaftContextRule {
     joinFuture.get(1, TimeUnit.SECONDS);
   }
 
-  private void createRaftContexts(final int nodeCount) {
+  private void createRaftContexts(final int nodeCount, final Random random) {
     for (int i = 0; i < nodeCount; i++) {
       final var memberId = MemberId.from(String.valueOf(i));
-      raftServers.put(memberId, createRaftContext(memberId));
+      raftServers.put(memberId, createRaftContext(memberId, random));
     }
   }
 
-  public RaftContext createRaftContext(final MemberId memberId) {
+  public RaftContext createRaftContext(final MemberId memberId, final Random random) {
     final var raft =
         new RaftContext(
             memberId.id() + "-partition-1",
@@ -152,14 +154,21 @@ public class RaftContextRule {
             mock(ClusterMembershipService.class),
             new ControllableRaftServerProtocol(memberId, serverProtocols, messageQueue),
             createStorage(memberId),
-            (f, u) ->
-                deterministicExecutors.computeIfAbsent(
-                    memberId,
-                    m ->
-                        (DeterministicSingleThreadContext)
-                            DeterministicSingleThreadContext.createContext(f, u)));
+            getRaftThreadContextFactory(memberId),
+            32 * 1024, // Copied from defaults
+            2, // Copied from defaults
+            () -> random);
     raft.setEntryValidator(new NoopEntryValidator());
     return raft;
+  }
+
+  private RaftThreadContextFactory getRaftThreadContextFactory(final MemberId memberId) {
+    return (f, u) ->
+        deterministicExecutors.computeIfAbsent(
+            memberId,
+            m ->
+                (DeterministicSingleThreadContext)
+                    DeterministicSingleThreadContext.createContext(f, u));
   }
 
   private RaftStorage createStorage(final MemberId memberId) {
@@ -174,7 +183,6 @@ public class RaftContextRule {
         RaftStorage.builder()
             .withStorageLevel(StorageLevel.DISK)
             .withDirectory(memberDirectory)
-            .withMaxEntriesPerSegment(10)
             .withMaxSegmentSize(1024 * 10)
             .withFreeDiskSpace(100)
             .withSnapshotStore(new TestSnapshotStore(new AtomicReference<>()))
@@ -202,33 +210,16 @@ public class RaftContextRule {
     return getDeterministicScheduler(MemberId.from(String.valueOf(memberId)));
   }
 
-  public void tickElectionTimeout(final int memberId) {
-    getDeterministicScheduler(memberId).tick(electionTimeout.toMillis(), TimeUnit.MILLISECONDS);
-  }
+  // Methods to control the execution of raft threads
 
-  public void tickElectionTimeout(final MemberId memberId) {
-    getDeterministicScheduler(memberId).tick(electionTimeout.toMillis(), TimeUnit.MILLISECONDS);
-  }
-
+  // run until there are no more message and task to process
   public void runUntilDone() {
     final var serverIds = raftServers.keySet();
     processAllMessage();
     serverIds.forEach(memberId -> getDeterministicScheduler(memberId).runUntilIdle());
   }
 
-  public void processAllMessage() {
-    final var serverIds = raftServers.keySet();
-    serverIds.forEach(memberId -> getServerProtocol(memberId).receiveAll());
-  }
-
-  public void processAllMessage(final MemberId memberId) {
-    getServerProtocol(memberId).receiveAll();
-  }
-
-  public void processNextMessage(final MemberId memberId) {
-    getServerProtocol(memberId).receiveNextMessage();
-  }
-
+  // run until there are no more tasks to processon member's scheduler
   public void runUntilDone(final int memberId) {
     getServerProtocol(memberId).receiveAll();
     getDeterministicScheduler(memberId).runUntilIdle();
@@ -247,6 +238,29 @@ public class RaftContextRule {
     }
   }
 
+  // Submit all messages from the incoming queue to the schedulers to process
+  public void processAllMessage() {
+    final var serverIds = raftServers.keySet();
+    serverIds.forEach(memberId -> getServerProtocol(memberId).receiveAll());
+  }
+
+  public void processAllMessage(final MemberId memberId) {
+    getServerProtocol(memberId).receiveAll();
+  }
+
+  // Submit the next message from the incoming queue to the scheduler of memberid.
+  public void processNextMessage(final MemberId memberId) {
+    getServerProtocol(memberId).receiveNextMessage();
+  }
+
+  public void tickElectionTimeout(final int memberId) {
+    getDeterministicScheduler(memberId).tick(electionTimeout.toMillis(), TimeUnit.MILLISECONDS);
+  }
+
+  public void tickElectionTimeout(final MemberId memberId) {
+    getDeterministicScheduler(memberId).tick(electionTimeout.toMillis(), TimeUnit.MILLISECONDS);
+  }
+
   public void tickHeartbeatTimeout(final int memberId) {
     getDeterministicScheduler(memberId).tick(hearbeatTimeout.toMillis(), TimeUnit.MILLISECONDS);
   }
@@ -259,8 +273,9 @@ public class RaftContextRule {
     getDeterministicScheduler(memberId).tick(time.toMillis(), TimeUnit.MILLISECONDS);
   }
 
+  // Execute an append on memberid. If memberid is not the the leader, the append will be rejected.
   public void clientAppend(final MemberId memberId) {
-    final var role = getRaftServer(memberId).getRaftRole();
+    final var role = getRaftContext(memberId).getRaftRole();
     if (role instanceof LeaderRole) {
       final ByteBuffer data = ByteBuffer.allocate(Integer.BYTES).putInt(0, nextEntry++);
       final LeaderRole leaderRole = (LeaderRole) role;
@@ -268,6 +283,7 @@ public class RaftContextRule {
     }
   }
 
+  // Find current leader and execute an append
   public void clientAppendOnLeader() {
     final var leaderTerm = leadersAtTerms.keySet().stream().max(Long::compareTo);
     final var leader = leadersAtTerms.get(leaderTerm);
@@ -276,6 +292,9 @@ public class RaftContextRule {
     }
   }
 
+  // Verifications
+
+  // Verify that committed entries in all logs are equal
   public void assertAllLogsEqual() {
     final var readers =
         raftServers.values().stream()

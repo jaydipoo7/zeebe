@@ -15,84 +15,98 @@
  */
 package io.atomix.raft;
 
-import java.util.ArrayList;
-import java.util.Collection;
+import com.google.common.io.Files;
+import io.atomix.cluster.MemberId;
+import io.zeebe.util.FileUtil;
+import java.io.File;
+import java.io.IOException;
 import java.util.List;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameter;
-import org.junit.runners.Parameterized.Parameters;
+import java.util.Random;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import net.jqwik.api.Arbitraries;
+import net.jqwik.api.Arbitrary;
+import net.jqwik.api.ForAll;
+import net.jqwik.api.Property;
+import net.jqwik.api.Provide;
+import net.jqwik.api.ShrinkingMode;
+import net.jqwik.api.lifecycle.AfterTry;
+import net.jqwik.api.lifecycle.BeforeContainer;
 
-@RunWith(Parameterized.class)
 public class RandomizedRaftTest {
 
-  public static final int STEPCOUNT = 100000;
+  static List<RaftOperation> operations;
+  static List<MemberId> raftMembers;
+  private static final int OPERATION_SIZE = 100000;
+  public ControllableRaftContexts raftContexts;
+  File raftDataDirectory;
 
-  @Rule
-  @Parameter(0)
-  public RaftContextRule raftRule;
-
-  @Parameter(1)
-  public long pmfSeed;
-
-  @Parameter(2)
-  public long operationsSeed;
-
-  private List<Runnable> randomOperations;
-
-  @Parameters(name = "{0}")
-  public static Collection<Object[]> generateRandomOperations() {
-    final List<Object[]> schedules = new ArrayList<>();
-    for (int i = 1; i <= 10; i++) {
-      for (int j = 1; j <= 10; j++) {
-        final var raftRule = new RaftContextRule(3);
-        schedules.add(new Object[] {raftRule, i, j * System.currentTimeMillis()});
-      }
-      for (int j = 1; j <= 10; j++) {
-        final var raftRule = new RaftContextRule(3);
-        schedules.add(new Object[] {raftRule, i, j});
-      }
-    }
-    return schedules;
+  @BeforeContainer
+  public static void initOperations() {
+    // Need members ids to generate pair operations
+    final var servers =
+        IntStream.range(0, 3)
+            .mapToObj(String::valueOf)
+            .map(MemberId::from)
+            .collect(Collectors.toList());
+    operations = RaftOperation.getDefaultRaftOperations(servers);
+    raftMembers = List.copyOf(servers);
   }
 
-  @Before
-  public void before() {
-    /*final RandomOpGenerator randomOpGenerator =
-        new RandomOpGenerator(
-            RandomOpGenerator.getDefaultRaftOperations(raftRule),
-            raftRule.getRaftServers().keySet());
-    final var pmf = randomOpGenerator.generateOpProbabilityFunction(pmfSeed);
-    randomOperations = randomOpGenerator.generateRandomOperations(operationsSeed, pmf, STEPCOUNT);
-    raftRule
-        .getRaftServers()
-        .keySet()
-        .forEach(s -> raftRule.getServerProtocol(s).setDeliverImmediately(false));*/
+  @AfterTry
+  public void shutDownRaftNodes() throws IOException {
+    raftContexts.shudown();
+    FileUtil.deleteFolder(raftDataDirectory.toPath());
+    raftDataDirectory = null;
   }
 
-  @After
-  public void after() {
-    randomOperations.clear();
-  }
+  @Property(tries = 10, shrinking = ShrinkingMode.OFF)
+  void raftProperty(
+      @ForAll("raftOperations") final List<RaftOperation> raftOperations,
+      @ForAll("raftMembers") final List<MemberId> raftMembers,
+      @ForAll("seeds") final long seed)
+      throws Exception {
 
-  @Test
-  public void verifyRaftProperties() {
+    setUpRaftNodes(new Random(seed));
+
     int step = 0;
-    for (final Runnable operation : randomOperations) {
+    final var memberIter = raftMembers.iterator();
+    for (final RaftOperation operation : raftOperations) {
       step++;
-      if (operation != null) {
-        operation.run();
-        raftRule.assertOnlyOneLeader();
-      }
+
+      operation.run(raftContexts, memberIter.next());
+      raftContexts.assertOnlyOneLeader();
+
       if (step % 1000 == 0) { // reading logs after every operation is too slow
-        raftRule.assertAllLogsEqual();
+        raftContexts.assertAllLogsEqual();
         step = 0;
       }
     }
-    raftRule.assertAllLogsEqual();
+
+    raftContexts.assertAllLogsEqual();
+  }
+
+  @Provide
+  Arbitrary<List<RaftOperation>> raftOperations() {
+    final var operation = Arbitraries.of(operations);
+    return operation.list().ofSize(OPERATION_SIZE);
+  }
+
+  @Provide
+  Arbitrary<List<MemberId>> raftMembers() {
+    final var members = Arbitraries.of(raftMembers);
+    return members.list().ofSize(OPERATION_SIZE);
+  }
+
+  @Provide
+  Arbitrary<Long> seeds() {
+    return Arbitraries.longs();
+  }
+
+  private void setUpRaftNodes(final Random random) throws Exception {
+    // Couldnot make @TempDir annotation work
+    raftDataDirectory = Files.createTempDir();
+    raftContexts = new ControllableRaftContexts(3);
+    raftContexts.setup(raftDataDirectory.toPath(), random);
   }
 }
