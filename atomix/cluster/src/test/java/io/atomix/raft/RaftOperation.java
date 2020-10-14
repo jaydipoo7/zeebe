@@ -37,7 +37,8 @@ public class RaftOperation {
     return new RaftOperation(name, operation);
   }
 
-  public void run(final ControllableRaftContexts controllableRaftContexts, final MemberId memberId) {
+  public void run(
+      final ControllableRaftContexts controllableRaftContexts, final MemberId memberId) {
     LoggerFactory.getLogger("TEST").info("Running {} on {}", name, memberId);
     operation.accept(controllableRaftContexts, memberId);
   }
